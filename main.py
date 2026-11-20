@@ -129,11 +129,23 @@ def std_pop(values) -> float:
 
 
 def quantiles_from(median_logit: float, spread: float) -> list:
+    # Robustness: a poisoned fit must never leak NaN/inf into the output.
+    if not math.isfinite(median_logit):
+        median_logit = 0.0
+    if not math.isfinite(spread) or spread < 0:
+        spread = 2.0
     qs = [round4(clamp_pct(sigmoid(median_logit + z * spread))) for z in Z]
-    for i in range(1, len(qs)):
-        if qs[i] < qs[i - 1]:
-            qs[i] = qs[i - 1]
-    return qs
+    # Final guarantee pass: finite, inside [0, 100], non-decreasing.
+    clean = []
+    for q in qs:
+        value = float(q)
+        if not math.isfinite(value):
+            value = clean[-1] if clean else 50.0
+        value = min(100.0, max(0.0, value))
+        if clean and value < clean[-1]:
+            value = clean[-1]
+        clean.append(int(value) if value == int(value) else value)
+    return clean
 
 
 def forecast_trophy(reads, target_hours: float, horizon_days: float) -> list:
@@ -141,7 +153,18 @@ def forecast_trophy(reads, target_hours: float, horizon_days: float) -> list:
 
     reads: [(hours since epoch, rate or None)], oldest first.
     """
-    points = [(h, r) for h, r in reads if r is not None]
+    # Robustness: keep only reads whose hour and rate are real finite
+    # numbers -- a bool, string, NaN or inf rate from a damaged read must
+    # not poison the flat check or the ensemble fits below.
+    points = [
+        (h, r)
+        for h, r in reads
+        if isinstance(r, (int, float))
+        and not isinstance(r, bool)
+        and math.isfinite(r)
+        and isinstance(h, (int, float))
+        and math.isfinite(h)
+    ]
     if not points:
         # No usable read at all: a wide, centred forecast.
         return quantiles_from(0.0, 2.0)
@@ -210,7 +233,14 @@ def forecast_case(case: dict, name: str) -> dict:
     if not history:
         raise ValueError(f"{name} has no history")
     target_hours = hours_since_epoch(parse_time(case["target"]))
-    horizon_days = float(case["horizon_minutes"]) / 1440.0
+    # Robustness: a missing or non-numeric horizon must not crash the run;
+    # a negative or non-finite one is meaningless, so fall back to zero.
+    try:
+        horizon_days = float(case.get("horizon_minutes")) / 1440.0
+    except (TypeError, ValueError):
+        horizon_days = 0.0
+    if not math.isfinite(horizon_days) or horizon_days < 0:
+        horizon_days = 0.0
     read_hours = [hours_since_epoch(parse_time(read["at"])) for read in history]
     rows = []
     for i, trophy in enumerate(case["trophies"]):
